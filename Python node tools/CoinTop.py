@@ -1,13 +1,12 @@
 import json
 import requests
 import time
-from unicurses import *  # Using the updated 3.13 compatible wrapper
+from unicurses import *  # Imports curses functions directly into global scope
 
 # --- CONFIGURATION ---
 RPC_URL = "http://127.0.0.1:37071"
-RPC_USER = "#### Put your username here ####"
-RPC_PASS = "#### Put your password here ####"
-
+RPC_USER = "your_rpc_username"
+RPC_PASS = "your_rpc_password"
 MIN_COIN_AGE_BLOCKS = 288 
 # ---------------------
 
@@ -37,9 +36,9 @@ def draw_dashboard(stdscr):
         mempool_info = rpc_call("getmempoolinfo") or {"size": 0, "bytes": 0}
         unspent_list = rpc_call("listunspent") or []
         
-        # 📌 FIX: Added clear keyboard interaction hints, [2], [3] to the header
+        # Header Layout Text with clear keyboard indicators
         mvaddstr(0, 0, f"⚡ NODE-TOP | Blocks: {block_count} | Mempool: {mempool_info.get('size')} txs ({mempool_info.get('bytes')/1024:.1f} KB)")
-        mvaddstr(1, 0, " [1] Unapproved Mempool    [2] Wallet Balances    [3] Maturity Watch    [Q] Quit")
+        mvaddstr(1, 0, " Unapproved Mempool    Wallet Balances    Maturity Watch    [Q] Quit")
         mvaddstr(2, 0, "-" * (width - 1))
         
         # ----------------------------------------------------
@@ -101,7 +100,7 @@ def draw_dashboard(stdscr):
                 addr = utxo.get("address", "Unknown")
                 balances[addr] = balances.get(addr, 0.0) + utxo.get("amount", 0.0)
             
-            sorted_balances = sorted(balances.items(), key=lambda x: x[1], reverse=True)
+            sorted_balances = sorted(balances.items(), key=lambda x: x, reverse=True)
             
             mvaddstr(5, 0, f"{'Address':<40} | {'Balance (PKOIN)':<25}")
             mvaddstr(6, 0, "=" * (width - 1))
@@ -112,7 +111,7 @@ def draw_dashboard(stdscr):
                 mvaddstr(7 + idx, 0, f"{addr:<40} | {amt:<25.8f}{flag}")
                     
         # ----------------------------------------------------
-        # VIEW 3: COOLDOWN MATURITY MONITORING
+        # VIEW 3: COOLDOWN MATURITY MONITORING (SORTED SOONEST TO MATURE FIRST)
         # ----------------------------------------------------
         elif current_view == 3:
             mvaddstr(3, 0, f"⏳ VIEW: UTXO MATURITY TRACKER")
@@ -120,7 +119,9 @@ def draw_dashboard(stdscr):
             mvaddstr(6, 0, "=" * (width - 1))
             
             immature_utxos = [u for u in unspent_list if u.get("confirmations", 0) < MIN_COIN_AGE_BLOCKS]
-            immature_utxos.sort(key=lambda x: x.get("confirmations", 0))
+            
+            # 📌 FIX: Added reverse=True so the highest confirmations (closest to maturity) hit the top of the terminal
+            immature_utxos.sort(key=lambda x: x.get("confirmations", 0), reverse=True)
             
             if not immature_utxos:
                 mvaddstr(7, 2, "All coins are fully mature.")
