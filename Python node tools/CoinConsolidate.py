@@ -103,7 +103,7 @@ def main():
             for addr, data in address_data.items()
             if data["total_balance"] < TARGET_CAP
         ]
-        fillable_addresses.sort(key=lambda x: x["balance"], reverse=True)
+        fillable_addresses.sort(key=lambda x: x["balance"], reverse=False)
         
         # 📌 FIX: Safely index the first element [0] instead of treating the list as a dictionary
         destination_address = fillable_addresses[0]["address"] if fillable_addresses else None
