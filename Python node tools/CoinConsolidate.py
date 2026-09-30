@@ -4,16 +4,17 @@ import time
 import sys
 # --- CONFIGURATION ---
 RPC_URL = "http://127.0.0.1:37071"
-RPC_USER = "### put your username here ###"
-RPC_PASS = "### put your password here ###"
+RPC_USER = "#### Put your username here ####"
+RPC_PASS = "#### Put your password here ####"
 
-WALLET_PASSPHRASE = "" # Leave empty "" if unencrypted
-UTXO_COUNT_THRESHOLD = 5 # Fragmented address threshold
-MIN_COIN_AGE_BLOCKS = 288 # Confirmation age for "mature" coins
-TARGET_CAP = 1000.0 # Target balance ceiling per address
-FEE_ESTIMATE = 0.005 # Flat transaction fee
+WALLET_PASSPHRASE = ""       # Leave empty "" if unencrypted
+UTXO_COUNT_THRESHOLD = 5     # Fragmented address threshold
+MIN_COIN_AGE_BLOCKS = 288    # Confirmation age for "mature" coins
+TARGET_CAP = 1000.0          # Target balance ceiling per address
+FEE_ESTIMATE = 0.005         # Flat transaction fee
 DUST_LIMIT = 0.00010000
-MAX_INPUTS_PER_TX = 100 # Keep transaction sizes well under the 100KB limit
+MAX_INPUTS_PER_TX = 100      # Keep transaction sizes well under the 100KB limit
+ASSUME_YES = False           # Overridden to True if --yes is passed via CLI
 # ---------------------
 
 def rpc_call(method, params=[]):
@@ -27,14 +28,58 @@ def rpc_call(method, params=[]):
     except Exception as e:
         print(f"\n❌ Connection error: {e}")
         exit(1)
+
+def run_dry_run_simulation(address_data, fillable_addresses, TARGET_CAP):
+    """
+    Scans the local wallet dictionary mapping and prints out a clear 
+    blueprint of the actions Phase 1 and Phase 2 will execute.
+    """
+    print("\n🧐 ================= DRY-RUN SIMULATION PREVIEW ================= 🧐")
+    if not fillable_addresses:
+        print("✅ No fillable addresses found under the target cap. Nothing to do!")
+        return False
+
+    # Pull target details safely from index 0 of the sorted list array
+    target_addr = fillable_addresses[0]["address"]
+    current_bal = fillable_addresses[0]["balance"]
+    needed = round(TARGET_CAP - current_bal, 8)
+    
+    print(f"🎯 Target Address to Fill: {target_addr}")
+    print(f"   └── Current Balance: {current_bal:.8f} | Space Remaining: {needed:.8f} PKOIN")
+    
+    print("\n📋 Simulated Phase 1: Moving mature funds to target bucket...")
+    sim_received = 0.0
+    for addr, data in address_data.items():
+        if addr == target_addr or sim_received >= needed:
+            continue
+            
+        mature_count = sum(1 for tx in data["utxos"] if tx.get("confirmations", 0) >= MIN_COIN_AGE_BLOCKS)
+        mature_funds = sum(tx["amount"] for tx in data["utxos"] if tx.get("confirmations", 0) >= MIN_COIN_AGE_BLOCKS)
+        
+        if mature_count > UTXO_COUNT_THRESHOLD:
+            movable = round(mature_funds - FEE_ESTIMATE, 8)
+            if movable > 0:
+                print(f"   ├── Will pull {mature_count} inputs from source: {addr[:12]}...")
+                if movable > (needed - sim_received):
+                    chunk = round(needed - sim_received, 8)
+                    print(f"   │   └── Sending {chunk:.8f} to target (Sending remaining change back to source)")
+                    sim_received = needed
+                else:
+                    print(f"   │   └── Sending {movable:.8f} to target bucket")
+                    sim_received = round(sim_received + movable, 8)
+
+    print("\n📋 Simulated Phase 2: Internal fragmentation sweep...")
+    for addr, data in address_data.items():
+        mature_count = sum(1 for tx in data["utxos"] if tx.get("confirmations", 0) >= MIN_COIN_AGE_BLOCKS)
+        if mature_count > UTXO_COUNT_THRESHOLD:
+            print(f"   └── Address {addr[:12]}... has {mature_count} fragmented inputs. Will smash internally.")
+            
+    print("====================================================================")
+    return True
+
 def display_and_wait_for_targets(waiting_list):
-    """
-    Displays the explicit list of transactions, their target block heights, 
-    and dynamically ticks down based on the next required block milestone.
-    """
     if not waiting_list:
         return
-
     print("\n📋 ================= ACTIVE MATURITY WATCHLIST ================= 📋")
     print(f"{'Phase':<10} | {'Address':<12} | {'TxID Snippet':<18} | {'Target Block':<12}")
     print("-" * 62)
@@ -42,34 +87,27 @@ def display_and_wait_for_targets(waiting_list):
         print(f"{item['phase']:<10} | {item['address'][:12]} | {item['txid'][:16]}... | {item['target_block']:<12}")
     print("=" * 62)
 
-    # Find the absolute earliest block that we are waiting for to unlock data
     target_block = min(item['target_block'] for item in waiting_list)
-    
     while True:
         current_block = int(rpc_call("getblockcount"))
         blocks_remaining = target_block - current_block
-        
         if blocks_remaining <= 0:
             print("\n\n✅ Target block milestone reached! Resuming wallet sweep...")
             break
-            
         for seconds_left in range(60, 0, -1):
             sys.stdout.write(
                 f"\r⏱️  Current Block: {current_block} | Next Target: {target_block} ({blocks_remaining} blocks left) | Next Node Poll: {seconds_left}s  "
             )
             sys.stdout.flush()
             time.sleep(1)
+
 def main():
-    # Persistent cross-loop tracker for outputs that are maturing on the blockchain
     blockchain_waiting_list = []
 
     while True:
         current_block = int(rpc_call("getblockcount"))
-        
-        # Housekeeping: Remove items from our watch list that have successfully matured
         blockchain_waiting_list = [item for item in blockchain_waiting_list if current_block < item['target_block']]
 
-        # If we have items still cooling down, display them and wait for the next milestone
         if blockchain_waiting_list:
             display_and_wait_for_targets(blockchain_waiting_list)
             continue
@@ -104,8 +142,23 @@ def main():
             if data["total_balance"] < TARGET_CAP
         ]
         fillable_addresses.sort(key=lambda x: x["balance"], reverse=False)
+        # --- UNATTENDED CLI SWITCH & SIMULATION INTERLOCK ---
+        global ASSUME_YES
+        if len(sys.argv) > 1 and sys.argv[1].lower() == "--yes":
+            ASSUME_YES = True
+            print("🚀 Unattended Mode Enabled via command-line flag.")
+
+        run_dry_run_simulation(address_data, fillable_addresses, TARGET_CAP)
         
-        # 📌 FIX: Safely index the first element [0] instead of treating the list as a dictionary
+        if not ASSUME_YES:
+            confirm = input("\n❓ Proceed with these live blockchain movements? (y/n): ").strip().lower()
+            if confirm not in ['y', 'yes']:
+                print("👋 Consolidation cancelled by user. Exiting script.")
+                sys.exit(0)
+            print("✅ Confirmation received. Initiating execution cycles...")
+            ASSUME_YES = True  # Mutes the prompt for subsequent blocks in this run
+
+        # Safely index the first element of our sorted array to locate our targets
         destination_address = fillable_addresses[0]["address"] if fillable_addresses else None
         max_receivable = round(TARGET_CAP - fillable_addresses[0]["balance"], 8) if fillable_addresses else TARGET_CAP
 
@@ -115,7 +168,7 @@ def main():
             rpc_call("walletpassphrase", [WALLET_PASSPHRASE, 60])
 
         try:
-            # 1. PHASE 1: Fill target buckets to 1,000 coins
+            # 1. PHASE 1: Fill target buckets to the target threshold
             print("\n📋 Running Phase 1: Filling target buckets...")
             for addr, data in address_data.items():
                 if not destination_address or addr == destination_address:
@@ -218,17 +271,27 @@ def main():
                 "txid": "Unknown_Activity",
                 "target_block": current_block + 2
             })
+
 def execute_transaction(tx_inputs, tx_outputs):
     try:
         raw_tx = rpc_call("createrawtransaction", [tx_inputs, tx_outputs])
+        if not raw_tx:
+            print("❌ Node refused to build the raw transaction framework.")
+            return None
+            
         signed_tx = rpc_call("signrawtransactionwithwallet", [raw_tx])
-        
+        if not signed_tx:
+            print("❌ Node refused to call the wallet signature framework.")
+            return None
+            
         if signed_tx.get("complete", False):
             txid = rpc_call("sendrawtransaction", [signed_tx["hex"]])
             print(f"✅ Broadcast Success! TxID: {txid[:16]}...")
             return txid
         else:
             print("❌ Failed to complete the signature framework for this batch.")
+            if "errors" in signed_tx:
+                print(f"⚠️  Node Signature Error Log: {signed_tx['errors']}")
             return None
             
     except Exception as e:
