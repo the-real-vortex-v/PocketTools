@@ -38,11 +38,11 @@ def draw_dashboard(stdscr):
         
         # Header Layout Text with clear keyboard indicators
         mvaddstr(0, 0, f"⚡ NODE-TOP | Blocks: {block_count} | Mempool: {mempool_info.get('size')} txs ({mempool_info.get('bytes')/1024:.1f} KB)")
-        mvaddstr(1, 0, " Unapproved Mempool    Wallet Balances    Maturity Watch    [Q] Quit")
+        mvaddstr(1, 0, " [1] Unapproved Mempool    [2] Wallet Balances    [3] Maturity Watch    [Q] Quit")
         mvaddstr(2, 0, "-" * (width - 1))
         
         # ----------------------------------------------------
-        # VIEW 1: ADVANCED UNAPPROVED MEMPOOL METRICS WITH TX TYPE
+        # VIEW 1: ADVANCED UNAPPROVED MEMPOOL METRICS WITH 8-DECIMAL FEES
         # ----------------------------------------------------
         if current_view == 1:
             mvaddstr(3, 0, "📋 VIEW: DETAILED PENDING MEMPOOL TRANSACTIONS")
@@ -52,7 +52,8 @@ def draw_dashboard(stdscr):
             if not verbose_mempool:
                 mvaddstr(5, 2, "✨ Mempool is completely empty. No transactions pending.")
             else:
-                mvaddstr(5, 0, f"{'Transaction ID (TXID)':<66} | {'Type':<12} | {'Fee Rate':<12} | {'Age':<6} | {'Fees (PKOIN)':<10}")
+                # 📌 Adjusted column headers spacing for 8 decimals
+                mvaddstr(5, 0, f"{'Transaction ID (TXID)':<66} | {'Type':<12} | {'Fee Rate':<12} | {'Age':<6} | {'Fees (PKOIN)':<14}")
                 mvaddstr(6, 0, "=" * (width - 1))
                 
                 current_time = time.time()
@@ -88,7 +89,8 @@ def draw_dashboard(stdscr):
                     else:
                         age_str = f"{age_seconds // 3600}h"
                         
-                    mvaddstr(7 + idx, 0, f"{txid:<66} | {tx_type:<12} | {feerate:<7} sat/vB | {age_str:<4} | {base_fee_pkoin:<10.5f}")
+                    # 📌 FIX: Format fees string with :<14.8f to preserve exact 8-decimal accuracy
+                    mvaddstr(7 + idx, 0, f"{txid:<66} | {tx_type:<12} | {feerate:<7} sat/vB | {age_str:<4} | {base_fee_pkoin:<14.8f}")
 
         # ----------------------------------------------------
         # VIEW 2: WALLET DISTRIBUTION VIEW
@@ -100,7 +102,7 @@ def draw_dashboard(stdscr):
                 addr = utxo.get("address", "Unknown")
                 balances[addr] = balances.get(addr, 0.0) + utxo.get("amount", 0.0)
             
-            sorted_balances = sorted(balances.items(), key=lambda x: x, reverse=True)
+            sorted_balances = sorted(balances.items(), key=lambda x: x[1], reverse=True)
             
             mvaddstr(5, 0, f"{'Address':<40} | {'Balance (PKOIN)':<25}")
             mvaddstr(6, 0, "=" * (width - 1))
@@ -111,7 +113,7 @@ def draw_dashboard(stdscr):
                 mvaddstr(7 + idx, 0, f"{addr:<40} | {amt:<25.8f}{flag}")
                     
         # ----------------------------------------------------
-        # VIEW 3: COOLDOWN MATURITY MONITORING (SORTED SOONEST TO MATURE FIRST)
+        # VIEW 3: COOLDOWN MATURITY MONITORING
         # ----------------------------------------------------
         elif current_view == 3:
             mvaddstr(3, 0, f"⏳ VIEW: UTXO MATURITY TRACKER")
@@ -119,8 +121,6 @@ def draw_dashboard(stdscr):
             mvaddstr(6, 0, "=" * (width - 1))
             
             immature_utxos = [u for u in unspent_list if u.get("confirmations", 0) < MIN_COIN_AGE_BLOCKS]
-            
-            # 📌 FIX: Added reverse=True so the highest confirmations (closest to maturity) hit the top of the terminal
             immature_utxos.sort(key=lambda x: x.get("confirmations", 0), reverse=True)
             
             if not immature_utxos:
