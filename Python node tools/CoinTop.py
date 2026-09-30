@@ -1,3 +1,4 @@
+# command line args: --report to generate a report into a text file called pkoin.report.txt
 import json
 import requests
 import time
