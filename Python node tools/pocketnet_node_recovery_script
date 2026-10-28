@@ -1,0 +1,839 @@
+import json
+import requests
+import sys
+import time
+import os
+import zipfile
+import tarfile
+import bz2
+import glob
+try:
+    import py7zr
+    HAS_7Z = True
+except ImportError:
+    HAS_7Z = False
+
+from colorama import init, Fore, Style
+
+# 📌 THE WINDOWS 10 ABSOLUTE FIX: Forces CMD/PowerShell to turn on ANSI decoding
+if os.name == 'nt':
+    os.system('color')
+
+# Initialize Colorama with cross-platform wrappers and automated style resetting
+init(autoreset=True)
+
+# --- CONFIGURATION (Default values) ---
+CONFIG_FILE_PATH = "node_recovery_config.json"
+
+DEFAULT_CONFIG = {
+    "RPC_URL": "http://127.0.0.1:37071",
+    "RPC_USER": "#### Put your username here ####",
+    "RPC_PASS": "#### Put your password here ####",
+    "MIN_PEERS_TO_SHOW": 2,
+    "PEER_RECOVERY_YELLOW_DURATION_SEC": 60,
+    "SEED_NODES": [
+        "seed.pocketcoin.app",
+        "seed2.pocketcoin.app",
+        "seed3.pocketcoin.app",
+        "node.pocketnet.app"
+    ],
+    "DEBUG_LOG_PATH": os.path.expanduser("~/.pocketnet/debug.log"),
+    "LOG_ARCHIVES_DIR": os.path.expanduser("~/.pocketnet/logs/"),
+    "CACHE_FILE_PATH": "node_history_cache.json"
+}
+
+def load_config():
+    """Loads configuration from file if it exists, otherwise creates it with defaults."""
+    if os.path.exists(CONFIG_FILE_PATH):
+        try:
+            with open(CONFIG_FILE_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                for k, v in DEFAULT_CONFIG.items():
+                    if k not in cfg:
+                        cfg[k] = v
+                return cfg
+        except Exception as e:
+            print(f"{Fore.YELLOW}[WARN] Could not load config file, using defaults: {e}{Style.RESET_ALL}")
+    save_config(DEFAULT_CONFIG)
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    """Saves configuration dictionary to local JSON storage."""
+    try:
+        with open(CONFIG_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+        print(f"{Fore.GREEN}[OK] Successfully updated and saved configuration.{Style.RESET_ALL}")
+    except Exception as e:
+        print(f"{Fore.YELLOW}[WARN] Could not save config file: {e}{Style.RESET_ALL}")
+
+# Load active configuration into global runtime variables
+CONFIG = load_config()
+RPC_URL = CONFIG["RPC_URL"]
+RPC_USER = CONFIG["RPC_USER"]
+RPC_PASS = CONFIG["RPC_PASS"]
+MIN_PEERS_TO_SHOW = CONFIG["MIN_PEERS_TO_SHOW"]
+PEER_RECOVERY_DURATION = CONFIG.get("PEER_RECOVERY_YELLOW_DURATION_SEC", 60)
+SEED_NODES = CONFIG["SEED_NODES"]
+DEBUG_LOG_PATH = CONFIG["DEBUG_LOG_PATH"]
+LOG_ARCHIVES_DIR = CONFIG["LOG_ARCHIVES_DIR"]
+CACHE_FILE_PATH = CONFIG["CACHE_FILE_PATH"]
+
+# 📌 TERMINAL-SAFE ICON MAP: Uses standard text on Windows, rich icons on Mac/Linux
+if os.name == 'nt':
+    ICON_CHECK   = "[CHK]"
+    ICON_ERROR   = "[ERR]"
+    ICON_SUCCESS = "[OK]"
+    ICON_ROCKET  = "[RUN]"
+    ICON_TREE    = "[TREE]"
+    ICON_PLUS    = "[+]"
+    ICON_WARN    = "[WARN]"
+    ICON_WRENCH  = "[FIX]"
+    ICON_CACHE   = "[CACHE]"
+    M_1, M_2, M_3, M_4, M_5, M_6, M_7, M_8, M_9 = "[1]", "[2]", "[3]", "[4]", "[5]", "[6]", "[7]", "[8]", "[9]"
+else:
+    ICON_CHECK   = "🔍"
+    ICON_ERROR   = "❌"
+    ICON_SUCCESS = "✅"
+    ICON_ROCKET  = "🚀"
+    ICON_TREE    = "🌱"
+    ICON_PLUS    = "➕"
+    ICON_WARN    = "⚠️"
+    ICON_WRENCH  = "🛠️"
+    ICON_CACHE   = "💾"
+    M_1, M_2, M_3, M_4, M_5, M_6, M_7, M_8, M_9 = "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"
+
+def rpc_call(method, params=[]):
+    """Executes a JSON-RPC command against the local Bitcoin/Pocketcoin daemon with robust error handling."""
+    payload = {"jsonrpc": "2.0", "id": "nodefix", "method": method, "params": params}
+    try:
+        response = requests.post(RPC_URL, auth=(RPC_USER, RPC_PASS), json=payload, timeout=15)
+        
+        if response.status_code == 500:
+            # Suppressed as normal operation / unindexed hash lookup
+            return None
+        elif response.status_code != 200:
+            print(f"{Fore.RED}{ICON_ERROR} RPC HTTP Error {response.status_code}: Check RPC URL/credentials or daemon status.{Style.RESET_ALL}")
+            return None
+            
+        text = response.text.strip()
+        if not text:
+            return None
+            
+        res_json = response.json()
+        if "error" in res_json and res_json["error"] is not None:
+            return None
+        return res_json.get("result")
+    except requests.exceptions.ConnectionError:
+        print(f"{Fore.RED}{ICON_ERROR} Failed to reach node: Connection refused at {RPC_URL}. Is pocketnetd running?{Style.RESET_ALL}")
+        return None
+    except requests.exceptions.Timeout:
+        print(f"{Fore.RED}{ICON_ERROR} Failed to reach node: RPC request timed out after 15 seconds.{Style.RESET_ALL}")
+        return None
+    except json.JSONDecodeError:
+        return None
+    except Exception:
+        return None
+
+def node_top_dashboard():
+    """Displays a real-time 'top'-like live status dashboard of node health, sync progress, and active forks with color-coded peers."""
+    global PEER_RECOVERY_DURATION
+    print(f"\n{Fore.CYAN}📊 Starting Node Health & Fork 'Top' Dashboard (Press Ctrl+C to exit)...{Style.RESET_ALL}")
+    try:
+        while True:
+            # Fetch all RPC and chaintips data FIRST before clearing the screen
+            blockchain_info = rpc_call("getblockchaininfo")
+            network_info = rpc_call("getnetworkinfo")
+            peer_info = rpc_call("getpeerinfo") or []
+            tips = rpc_call("getchaintips") or []
+            
+            if not blockchain_info or not network_info:
+                print(f"{Fore.RED}{ICON_ERROR} Daemon offline or unreachable. Retrying in 3s...{Style.RESET_ALL}")
+                time.sleep(3)
+                continue
+
+            local_height = blockchain_info.get("blocks", 0)
+            headers_height = blockchain_info.get("headers", 0)
+            difficulty = blockchain_info.get("difficulty", 0)
+            connections = network_info.get("connections", 0)
+            protocol_ver = network_info.get("protocolversion", 0)
+            
+            max_peer_height = 0
+            if peer_info:
+                peer_heights = [p.get("synced_blocks", 0) for p in peer_info]
+                max_peer_height = max(peer_heights) if peer_heights else 0
+
+            # Filter for ACTIVE / UNRESOLVED forks close to current local height (e.g. within 100 blocks)
+            # Exclude old historical valid-forks / valid-headers deep in the past and dead/inactive forks
+            active_forks = []
+            for t in tips:
+                status = t.get("status")
+                if status != "active" and status != "invalid":
+                    f_height = t.get("height", 0)
+                    # Only consider active forks close to our current chain tip (unresolved / current forks)
+                    if abs(f_height - local_height) <= 100:
+                        active_forks.append(t)
+
+            # Clear screen right before rendering the updated display
+            print("\033[H\033[J", end="")
+            print("==================================================")
+            print(f"{Fore.CYAN}🟢 PKOIN NODE LIVE HEALTH & FORK 'TOP' MONITOR{Style.RESET_ALL}")
+            print("==================================================")
+            
+            print(f"🕒 Timestamp:          {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"🧱 Local Height:       {Fore.GREEN}{local_height}{Style.RESET_ALL} (Headers: {headers_height})")
+            print(f"🌐 Max Peer Height:    {Fore.YELLOW}{max_peer_height}{Style.RESET_ALL}")
+            
+            if active_forks:
+                print(f"🚨 FORK STATUS:        {Fore.RED}ACTIVE FORK(S) DETECTED ({len(active_forks)} current divergent branch tip(s)){Style.RESET_ALL}")
+            else:
+                if max_peer_height > local_height:
+                    print(f"⚠️ Sync Status:        Behind peers by {max_peer_height - local_height} blocks")
+                else:
+                    print(f"✨ Sync Status:        Fully Synced / Chain Healthy")
+                    
+            print(f"🔗 Active Connections: {connections}")
+            print(f"⚙️ Protocol Version:   {protocol_ver}")
+            print(f"⛏️ Mining Difficulty:  {difficulty}")
+            
+            if active_forks:
+                print(f"\n{Fore.RED}--- 🌿 ACTIVE UNRESOLVED BLOCKCHAIN FORKS ---{Style.RESET_ALL}")
+                for idx, fork in enumerate(active_forks):
+                    f_status = fork.get("status")
+                    f_height = fork.get("height", 0)
+                    f_branch = fork.get("branchlen", 0)
+                    f_split = f_height - f_branch
+                    f_hash = fork.get("hash")
+                    
+                    diff_blocks = f_height - local_height
+                    if diff_blocks > 0:
+                        diff_str = f"Ahead of local tip by {diff_blocks} blocks"
+                    elif diff_blocks < 0:
+                        diff_str = f"Behind local tip by {abs(diff_blocks)} blocks"
+                    else:
+                        diff_str = f"At exact same height as local tip"
+
+                    # Find peers currently synced to this specific fork tip or branch
+                    fork_peers = [p for p in peer_info if p.get("synced_blocks", 0) == f_height or (f_split <= p.get("synced_blocks", 0) <= f_height)]
+
+                    print(f"  • Fork #{idx+1} [{f_status.upper()}]")
+                    print(f"    - Split Height: {f_split} | Depth: {f_branch} blocks deep")
+                    print(f"    - Tip Height:   {f_height} ({diff_str})")
+                    print(f"    - Tip Hash:     {f_hash}")
+                    if fork_peers:
+                        print(f"    - {Fore.RED}Nodes on this Bad Fork ({len(fork_peers)} connected):{Style.RESET_ALL}")
+                        for fp in fork_peers:
+                            print(f"        • IP: {fp.get('addr', 'unknown')} | Synced Height: {fp.get('synced_blocks', 0)} | Client: {fp.get('subver', 'unknown').replace('/', '')}")
+                    else:
+                        print(f"    - {Fore.YELLOW}No direct connected peers currently stuck on this fork tip height.{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW}ℹ️ Tip: Use Option [6] or [7] from the main menu to rollback and recover if stuck.{Style.RESET_ALL}")
+            else:
+                print(f"\n{Fore.GREEN}--- 🌿 NO ACTIVE UNRESOLVED FORKS DETECTED ---{Style.RESET_ALL}")
+
+            print(f"\n--- ALL CONNECTED PEERS ({len(peer_info)}) ---")
+            if peer_info:
+                print(f"{'IP Address':<22} | {'Height':<8} | {'Ping':<8} | {'Status / Client'}")
+                print("-" * 75)
+                current_time = time.time()
+                for p in peer_info:
+                    addr = p.get("addr", "unknown")[:21]
+                    synced = p.get("synced_blocks", 0)
+                    ping = f"{p.get('pingtime', 0)*1000:.0f}ms" if 'pingtime' in p else "N/A"
+                    subver = p.get("subver", "unknown").replace("/", "")[:18]
+                    
+                    is_forked_peer = any(f.get("height") == synced for f in active_forks)
+                    connect_time = p.get("conntime", current_time)
+                    time_since_conn = current_time - connect_time
+                    
+                    if is_forked_peer:
+                        color = Fore.RED
+                        status_label = "[FORKED]"
+                    elif time_since_conn < PEER_RECOVERY_DURATION:
+                        color = Fore.YELLOW
+                        status_label = "[RECOVERED]"
+                    else:
+                        color = Fore.GREEN
+                        status_label = "[HEALTHY]"
+                        
+                    print(f"{color}{addr:<22} | {synced:<8} | {ping:<8} | {status_label} {subver}{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.RED}No active peers connected.{Style.RESET_ALL}")
+
+            print("\nPress Ctrl+C to return to main menu.")
+            time.sleep(3)
+    except KeyboardInterrupt:
+        print(f"\n{Fore.GREEN}Exiting live health & fork dashboard.{Style.RESET_ALL}")
+
+def load_persistence_cache():
+    """Loads previously saved historical peer bad-chain analysis from local JSON storage."""
+    if os.path.exists(CACHE_FILE_PATH):
+        try:
+            with open(CACHE_FILE_PATH, "r", encoding="utf-8") as f:
+                print(f"{Fore.CYAN}{ICON_CACHE} Loaded historical node cache from {CACHE_FILE_PATH}{Style.RESET_ALL}")
+                return json.load(f)
+        except Exception as e:
+            print(f"{Fore.YELLOW}{ICON_WARN} Could not load persistence cache: {e}{Style.RESET_ALL}")
+    return {}
+
+def save_persistence_cache(cache_data):
+    """Saves historical peer bad-chain data to local JSON storage for future runs."""
+    try:
+        with open(CACHE_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, indent=4)
+        print(f"{Fore.GREEN}{ICON_CACHE} Successfully persisted historical node cache.{Style.RESET_ALL}")
+    except Exception as e:
+        print(f"{Fore.YELLOW}{ICON_WARN} Could not save persistence cache: {e}{Style.RESET_ALL}")
+
+def check_status():
+    """Performs comprehensive diagnostics on node height, header sync, and peer health."""
+    print(f"\n{ICON_CHECK} --- RUNNING NODE DIAGNOSTICS ---")
+    blockchain_info = rpc_call("getblockchaininfo")
+    network_info = rpc_call("getnetworkinfo")
+    peer_info = rpc_call("getpeerinfo") or []
+    
+    if not blockchain_info or not network_info:
+        print(f"{Fore.RED}{ICON_ERROR} Cannot diagnose. Daemon is offline or RPC credentials are wrong.{Style.RESET_ALL}")
+        return None
+
+    local_height = blockchain_info.get("blocks", 0)
+    headers_height = blockchain_info.get("headers", 0)
+    connections = network_info.get("connections", 0)
+    is_ibd = blockchain_info.get("initialblockdownload", False)
+
+    print(f"Local Block Height:     {local_height}")
+    print(f"Best Header Height:     {headers_height}")
+    print(f"Connected Peers:        {connections}")
+    print(f"Initial Block Download: {is_ibd}")
+
+    max_peer_height = 0
+    if peer_info:
+        peer_heights = [p.get("synced_blocks", 0) for p in peer_info]
+        max_peer_height = max(peer_heights) if peer_heights else 0
+        print(f"Max Peer Height:        {max_peer_height}")
+        
+        if local_height < max_peer_height:
+            print(f"{Fore.YELLOW}{ICON_WARN} STATUS: Node is lagging behind peers by {max_peer_height - local_height} blocks.{Style.RESET_ALL}")
+        elif local_height == max_peer_height and local_height < headers_height:
+            print(f"{Fore.YELLOW}{ICON_WARN} STATUS: Node is stuck on a bad block fork. Peers cannot feed us new blocks.{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.GREEN}{ICON_SUCCESS} STATUS: Node height matches its active peers.{Style.RESET_ALL}")
+    else:
+        print(f"{Fore.RED}{ICON_ERROR} STATUS: CRITICAL! Node has 0 connected peers. It is completely isolated.{Style.RESET_ALL}")
+        
+    return {
+        "local_height": local_height,
+        "headers_height": headers_height,
+        "max_peer_height": max_peer_height,
+        "connections": connections
+    }
+
+def kickstart_peers():
+    """Clears stale/banned nodes and injects healthy seed nodes to restore network reachability."""
+    print(f"\n{ICON_ROCKET} Clearing banned node list and injecting clean seed connections...")
+    rpc_call("clearbanned")
+    print(f"{Fore.GREEN}{ICON_SUCCESS} Local node ban list cleared.{Style.RESET_ALL}")
+    
+    added_count = 0
+    for seed in SEED_NODES:
+        result = rpc_call("addnode", [seed, "add"])
+        if result is not None:
+            print(f"{ICON_PLUS} Injected seed peer: {seed}")
+            added_count += 1
+    print(f"Kickstart complete. Attempted to force-inject {added_count} seed peers.")
+
+def scan_debug_log_for_bad_chains(force_rescan=False):
+    """Scans live debug.log and compressed archives (.zip, .tar, .tgz, .bz2, .7z) for peer bad-chain events and block/tx errors."""
+    historical_data = load_persistence_cache()
+    if historical_data and not force_rescan:
+        print(f"{Fore.GREEN}{ICON_CACHE} Using cached historical peer record (run option 7 to force full log re-ingestion).{Style.RESET_ALL}")
+        return historical_data
+
+    print(f"\n{ICON_CACHE} Scanning debug logs and compressed archives for historical peer events and errors...")
+    new_historical_data = {}
+    
+    log_files_to_scan = []
+    if os.path.exists(DEBUG_LOG_PATH):
+        log_files_to_scan.append(DEBUG_LOG_PATH)
+        
+    if os.path.exists(LOG_ARCHIVES_DIR):
+        for root, dirs, files in os.walk(LOG_ARCHIVES_DIR):
+            for file in files:
+                full_path = os.path.join(root, file)
+                if any(file.endswith(ext) for ext in [".zip", ".tar", ".gz", ".tgz", ".bz2", ".7z"]):
+                    log_files_to_scan.append(full_path)
+
+    for path in log_files_to_scan:
+        try:
+            if path.endswith(".zip"):
+                with zipfile.ZipFile(path, 'r') as z:
+                    for filename in z.namelist():
+                        if "debug.log" in filename or filename.endswith(".log"):
+                            with z.open(filename) as f:
+                                lines = [line.decode('utf-8', errors='ignore') for line in f.readlines()]
+                                new_historical_data = parse_log_lines(lines, new_historical_data)
+            elif path.endswith(".tar") or path.endswith(".tgz") or path.endswith(".gz"):
+                with tarfile.open(path, 'r:*') as tar:
+                    for member in tar.getmembers():
+                        if member.isfile() and ("debug.log" in member.name or member.name.endswith(".log")):
+                            f = tar.extractfile(member)
+                            if f:
+                                lines = [line.decode('utf-8', errors='ignore') for line in f.readlines()]
+                                new_historical_data = parse_log_lines(lines, new_historical_data)
+            elif path.endswith(".bz2"):
+                with bz2.BZ2File(path, 'rb') as bz:
+                    lines = [line.decode('utf-8', errors='ignore') for line in bz.readlines()]
+                    new_historical_data = parse_log_lines(lines, new_historical_data)
+            elif path.endswith(".7z"):
+                if HAS_7Z:
+                    try:
+                        import tempfile
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            with py7zr.SevenZipFile(path, mode='r') as sz:
+                                sz.extractall(path=tmpdir)
+                            for root_t, dirs_t, files_t in os.walk(tmpdir):
+                                for ft in files_t:
+                                    if "debug.log" in ft or ft.endswith(".log"):
+                                        with open(os.path.join(root_t, ft), 'rb') as f_7z:
+                                            lines = [line.decode('utf-8', errors='ignore') for line in f_7z.readlines()]
+                                            new_historical_data = parse_log_lines(lines, new_historical_data)
+                    except Exception as sz_err:
+                        print(f"{Fore.YELLOW}{ICON_WARN} Could not parse 7z archive {path}: {sz_err}{Style.RESET_ALL}")
+                else:
+                    print(f"{Fore.YELLOW}{ICON_WARN} Found .7z archive {path}, but 'py7zr' module is not installed. Run 'pip install py7zr' to support 7z archives.{Style.RESET_ALL}")
+            elif path == DEBUG_LOG_PATH:
+                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+                    new_historical_data = parse_log_lines(lines, new_historical_data)
+        except Exception as e:
+            print(f"{Fore.YELLOW}{ICON_WARN} Could not parse archive/log {path}: {e}{Style.RESET_ALL}")
+
+    save_persistence_cache(new_historical_data)
+    return new_historical_data
+
+def parse_log_lines(lines, historical_data):
+    """Parses raw text log lines to extract peer bad-chain/invalid events and transaction/block reconstruct errors."""
+    for line in lines:
+        # Ignore GUI update check logs as requested
+        if "GUI: Check updates" in line or "gui: check updates" in line.lower():
+            continue
+
+        if "peer=" in line:
+            try:
+                parts = line.split("peer=")
+                peer_id_part = parts[1].split()[0]
+                timestamp = line[:19] if len(line) >= 19 else "unknown_time"
+                
+                if any(term in line.lower() for term in ["bad", "invalid", "stale", "orphan", "reject", "disconnect", "non-standard"]):
+                    if peer_id_part not in historical_data:
+                        historical_data[peer_id_part] = {
+                            "events": 0, 
+                            "first_seen": timestamp, 
+                            "last_seen": timestamp,
+                            "last_reason": line.strip()
+                        }
+                    historical_data[peer_id_part]["events"] += 1
+                    historical_data[peer_id_part]["last_seen"] = timestamp
+                    historical_data[peer_id_part]["last_reason"] = line.strip()
+            except Exception:
+                continue
+                
+        # Capture specific block/transaction accessor/reconstruct errors indicating corrupted state or fork conflicts
+        if "Error:" in line or "error:" in line or "Accessor::GetBlock" in line or "reconstruct failed" in line or "LevelDB" in line:
+            timestamp = line[:19] if len(line) >= 19 else "unknown_time"
+            if "block_errors" not in historical_data:
+                historical_data["block_errors"] = []
+            if line.strip() not in [err["message"] for err in historical_data["block_errors"]]:
+                historical_data["block_errors"].append({
+                    "timestamp": timestamp,
+                    "message": line.strip()
+                })
+    return historical_data
+
+def inspect_block_and_transaction(block_hash, txid):
+    """Queries daemon to resolve block height, check if it's on active or dead chain, and inspect transaction details."""
+    result_info = {
+        "block_hash": block_hash,
+        "block_height": "Unknown",
+        "chain_status": "Unknown",
+        "txid": txid,
+        "tx_type": "Unknown",
+        "is_malformed": False,
+        "is_abandoned": False,
+        "is_coinstake": False,
+        "details": "",
+        "malformation_reason": ""
+    }
+
+    # 1. Try to get block info via getblock (Active Chain)
+    block_json = rpc_call("getblock", [block_hash])
+    if block_json:
+        result_info["block_height"] = block_json.get("height", "Unknown")
+        result_info["chain_status"] = "Active Chain (Verified in active local blockchain database)"
+        
+        txs = block_json.get("tx", [])
+        if txid in txs:
+            result_info["details"] = f"Transaction {txid} is referenced in block header at height {result_info['block_height']}, but failed local reconstruction."
+        else:
+            result_info["details"] = f"Block found at height {result_info['block_height']}, but txid {txid} was not in this block's tx list."
+    else:
+        # Block not found in active chain view -> check getblockheader
+        header_json = rpc_call("getblockheader", [block_hash])
+        if header_json:
+            result_info["block_height"] = header_json.get("height", "Unknown")
+            result_info["chain_status"] = "Dead / Alternative Fork Chain (Header exists in index, but block data unlinked or on stale/invalid fork)"
+            result_info["details"] = f"Block header found at height {result_info['block_height']} on a dead or alternative fork branch."
+        else:
+            result_info["block_height"] = "Not found in local database"
+            result_info["chain_status"] = "Dead Fork / Corrupted State / Pruned"
+            result_info["details"] = f"Block hash {block_hash} not found in active chain or header index. It belongs to an unlinked dead fork."
+
+    # 2. Inspect Transaction via getrawtransaction
+    if txid:
+        tx_json = rpc_call("getrawtransaction", [txid, True])
+        if tx_json:
+            result_info["is_abandoned"] = tx_json.get("abandoned", False)
+            vin = tx_json.get("vin", [])
+            vout = tx_json.get("vout", [])
+            
+            if vin and "coinbase" in vin[0]:
+                result_info["tx_type"] = "Coinbase (PoW Mint / Block Reward)"
+            else:
+                result_info["tx_type"] = "Standard Transfer / Pocketnet Content Post / Action Tx"
+            
+            if any("coinstake" in str(v).lower() for v in vout) or (len(vin) > 0 and "scriptSig" in vin[0] and len(vin[0]["scriptSig"].get("asm", "")) == 0):
+                result_info["is_coinstake"] = True
+                result_info["tx_type"] = "Coin Stake (PoS Mint)"
+                
+            result_info["is_malformed"] = False
+        else:
+            result_info["is_malformed"] = True
+            result_info["tx_type"] = "Unknown / Unindexable Transaction Data"
+            result_info["malformation_reason"] = (
+                "The transaction index database (LevelDB) returned no return data for this txid. "
+                "This typically happens due to a database corruption, a missing .ldb file in the chainstate, "
+                "or a transaction that was accepted on an invalid fork branch whose transaction index was never fully reconstructed."
+            )
+
+    return result_info
+
+def generate_fork_tree():
+    """Inspects chain tips, maps divergent consensus forks, and groups active peers according to MIN_PEERS_TO_SHOW threshold."""
+    print(f"\n{ICON_TREE} --- GENERATING NETWORK FORK TREE & HISTORICAL PEER MAP ---")
+    tips = rpc_call("getchaintips")
+    blockchain_info = rpc_call("getblockchaininfo") or {}
+    local_height = blockchain_info.get("blocks", 0)
+    peers = rpc_call("getpeerinfo") or []
+    
+    if not tips:
+        print(f"{Fore.RED}{ICON_ERROR} Could not fetch chaintips metadata from daemon database.{Style.RESET_ALL}")
+        return []
+
+    print(f"{Fore.CYAN}📖 FORK & BAD FORK DETECTION LOGIC:{Style.RESET_ALL}")
+    print(" 1. active: The primary chain branch your local node is currently following.")
+    print(" 2. valid-fork / valid-headers: Alternative chains that follow valid consensus rules")
+    print("    but have accumulated less cumulative proof-of-work than active tip.")
+    print(" 3. stale: Chains that branched off earlier and stopped receiving new blocks.")
+    print(" 4. invalid: Chains containing blocks that violate consensus rules.\n")
+
+    log_history = scan_debug_log_for_bad_chains(force_rescan=False)
+
+    block_errors = log_history.get("block_errors", [])
+    if block_errors:
+        print(f"{Fore.YELLOW}{ICON_WARN} --- LOG ERROR ANALYSIS: CORRUPTED BLOCK / TX RECONSTRUCT ERRORS ---{Style.RESET_ALL}")
+        print(f"Filtered out GUI update notices. Analyzing database/block accessor errors:")
+        
+        target_block_hash = "f05521c769a50ecb8a00794e6d2da6427c7abee99be7bd7ff5fad7afbbce12c7"
+        target_txid = "c22a0c9d04b19c70cf3eb41556074a5b69aaf0e796742c021e1aa32a47f2658a"
+        
+        inspected_info = inspect_block_and_transaction(target_block_hash, target_txid)
+        
+        print(f"\n   {Fore.CYAN}🔍 DEEP INSPECTION OF ERROR BLOCK & TRANSACTION:{Style.RESET_ALL}")
+        print(f"   • Target Block Hash: {target_block_hash}")
+        print(f"     - Resolved Height: {Fore.YELLOW}{inspected_info['block_height']}{Style.RESET_ALL}")
+        print(f"     - Chain Linkage:   {Fore.RED if 'Dead' in inspected_info['chain_status'] else Fore.GREEN}{inspected_info['chain_status']}{Style.RESET_ALL}")
+        print(f"     - Details:         {inspected_info['details']}")
+        print(f"   • Target Transaction: {target_txid}")
+        print(f"     - Transaction Type: {Fore.CYAN}{inspected_info['tx_type']}{Style.RESET_ALL}")
+        print(f"     - Is Malformed?:    {Fore.RED if inspected_info['is_malformed'] else 'No'}{Style.RESET_ALL}")
+        if inspected_info['is_malformed']:
+            print(f"       Reason / Cause:   {Fore.YELLOW}{inspected_info['malformation_reason']}{Style.RESET_ALL}")
+        print(f"     - Is Abandoned?:    {Fore.YELLOW if inspected_info['is_abandoned'] else 'No'}{Style.RESET_ALL}")
+        print(f"     - Is Coin Stake?:   {Fore.GREEN if inspected_info['is_coinstake'] else 'No'}{Style.RESET_ALL}\n")
+
+    print(f"Filter Active: Displaying main chain and ONLY active unresolved forks close to local height with at least {MIN_PEERS_TO_SHOW} connected peers.\n")
+
+    peer_distribution = {}
+    for p in peers:
+        p_height = p.get("synced_blocks", 0)
+        p_addr = p.get("addr", "unknown_ip")
+        p_subver = p.get("subver", "unknown_client")
+        p_id = str(p.get("id", ""))
+        
+        history_info = log_history.get(p_id, None)
+        
+        if p_height not in peer_distribution:
+            peer_distribution[p_height] = []
+        peer_distribution[p_height].append({
+            "addr": p_addr, 
+            "subver": p_subver, 
+            "id": p_id,
+            "history": history_info
+        })
+
+    hidden_count = 0
+
+    for idx, tip in enumerate(tips):
+        status = tip.get("status")
+        height = tip.get("height")
+        branch_len = tip.get("branchlen", 0)
+        fork_block = height - branch_len
+        tip_hash = tip.get("hash")
+        
+        # Hide old historical tips far behind or far ahead of current local height
+        if status != "active" and abs(height - local_height) > 100:
+            hidden_count += 1
+            continue
+
+        matched_peers = []
+        nodes_on_tip = peer_distribution.get(height, [])
+        matched_peers.extend(nodes_on_tip)
+
+        nodes_on_branch = 0
+        if branch_len > 0:
+            for b_height in range(fork_block + 1, height):
+                b_peers = peer_distribution.get(b_height, [])
+                matched_peers.extend(b_peers)
+        
+        total_nodes_on_fork = len(matched_peers)
+
+        # Apply Display Filter: Hide inactive forks or forks below MIN_PEERS_TO_SHOW threshold (except active chain)
+        if status != "active" and total_nodes_on_fork < MIN_PEERS_TO_SHOW:
+            hidden_count += 1
+            continue
+
+        if status == "active":
+            print(f"{Fore.GREEN}[MAIN CHAIN TIP]{Style.RESET_ALL} (Active Network Node Baseline - {total_nodes_on_fork} peers)")
+            print(f"   ├── Tip Block: Height {height}")
+            print(f"   └── Hash:      {tip_hash}")
+            if matched_peers:
+                print(f"   └── {Fore.GREEN}Good Chain Peers ({len(matched_peers)} connected):{Style.RESET_ALL}")
+                for peer in matched_peers:
+                    hist_text = f" | [!] Log alerts: {peer['history']['events']} times (First seen: {peer['history']['first_seen']})" if peer['history'] else ""
+                    print(f"        • IP: {peer['addr']} | Client: {peer['subver']}{hist_text}")
+            else:
+                print(f"   └── {Fore.YELLOW}0 direct peers synced to main chain tip.{Style.RESET_ALL}")
+            print()
+        else:
+            hash_matched_in_errors = any(tip_hash in err['message'] for err in block_errors)
+            error_flag_text = f" {Fore.RED}[🚨 MATCHED IN LOG ERRORS]{Style.RESET_ALL}" if hash_matched_in_errors else ""
+            
+            # Cross-reference with log history to see which peers explicitly triggered invalid/bad chain warnings
+            bad_broadcasters = [p for p in matched_peers if p['history'] and p['history']['events'] > 0]
+
+            print(f"{Fore.RED}[ACTIVE FORK #{idx}]{Style.RESET_ALL}{error_flag_text}")
+            print(f"   ├── Status Type:  {status}")
+            print(f"   ├── Split Height: Branch broken away from Main Chain at block {fork_block}")
+            print(f"   ├── Fork Depth:   Progressed {branch_len} blocks deep onto its own path")
+            print(f"   ├── Branch Tip:   Block {height}")
+            print(f"   └── Tip Hash:     {tip_hash}")
+            print(f"   └── {Fore.RED}Active Fork Peers ({total_nodes_on_fork} connected):{Style.RESET_ALL}")
+            for peer in matched_peers:
+                hist_text = f" | {Fore.RED}[⚠️ Flagged in logs: {peer['history']['events']} bad chain event(s)]{Style.RESET_ALL}" if peer['history'] and peer['history']['events'] > 0 else " | [Clean history]"
+                print(f"        • IP: {peer['addr']} | Client: {peer['subver']}{hist_text}")
+            
+            if bad_broadcasters:
+                print(f"   └── {Fore.YELLOW}⚠️ Suspicious Nodes Suspected of Serving/Broadcasting This Fork:{Style.RESET_ALL}")
+                for bp in bad_broadcasters:
+                    print(f"        • IP: {bp['addr']} | Last Bad Event: {bp['history']['last_reason']}")
+            print()
+            
+    if hidden_count > 0:
+        print(f"Note: Filtered out {hidden_count} old historical or low-peer fork branches.")
+
+def fix_fork_at_height(height):
+    """Manually invalidates a specific block height and rolls back the active chain."""
+    print(f"\n{ICON_WRENCH} Attempting to resolve fork line at block height {height}...")
+    block_hash = rpc_call("getblockhash", [int(height)])
+    if not block_hash:
+        print(f"{Fore.RED}{ICON_ERROR} Could not resolve the hash for block height {height}.{Style.RESET_ALL}")
+        return False
+        
+    print(f"Target Block Hash found: {block_hash}")
+    print("Sending 'invalidateblock' payload to node daemon memory...")
+    rpc_call("invalidateblock", [block_hash])
+    
+    print(f"{Fore.GREEN}{ICON_SUCCESS} Block path marked as invalid and rolled back.{Style.RESET_ALL}")
+    time.sleep(2)
+    print("Sending 'reconsiderblock' payload to restart peer synchronization download from honest peers...")
+    rpc_call("reconsiderblock", [block_hash])
+    print(f"{Fore.GREEN}{ICON_SUCCESS} Reconsider command sent. Node will re-evaluate alternative valid headers.{Style.RESET_ALL}")
+    return True
+
+def auto_recover_forks():
+    """Automated recovery workflow: evaluates chaintips, rollbacks bad history, and reconnects to seed nodes."""
+    print(f"\n{ICON_WRENCH} --- STARTING AUTOMATED FORK RECOVERY ---")
+    tips = rpc_call("getchaintips")
+    if not tips:
+        print(f"{Fore.RED}{ICON_ERROR} Unable to retrieve chaintips for automated analysis.{Style.RESET_ALL}")
+        return
+
+    active_tip = next((t for t in tips if t.get("status") == "active"), None)
+    if not active_tip:
+        print(f"{Fore.RED}{ICON_ERROR} No active chain tip found! Node database might be severely corrupted.{Style.RESET_ALL}")
+        return
+
+    active_status = active_tip.get("status")
+    active_height = active_tip.get("height", 0)
+    
+    print(f"Current Active Tip Status: {active_status} at Height {active_height}")
+
+    status_info = check_status()
+    max_peer_height = status_info["max_peer_height"] if status_info else 0
+
+    if active_status == "invalid" or (max_peer_height > 0 and active_height < max_peer_height - 5):
+        print(f"{Fore.YELLOW}{ICON_WARN} Detected divergent or broken consensus state! Initiating corrective rollback...{Style.RESET_ALL}")
+        
+        target_rollback_height = None
+        for tip in tips:
+            if tip.get("status") != "active":
+                branch_len = tip.get("branchlen", 0)
+                height = tip.get("height", 0)
+                split_height = height - branch_len
+                if target_rollback_height is None or split_height < target_rollback_height:
+                    target_rollback_height = split_height
+
+        if target_rollback_height is None:
+            target_rollback_height = max(0, active_height - 5)
+
+        print(f"Calculated safe rollback target height: {target_rollback_height}")
+        fix_fork_at_height(target_rollback_height)
+        
+        kickstart_peers()
+        print(f"\n{Fore.GREEN}{ICON_SUCCESS} Automated recovery sequence executed successfully. Monitor logs for sync progress.{Style.RESET_ALL}")
+    else:
+        print(f"{Fore.GREEN}{ICON_SUCCESS} Node is on a healthy or active chain tip. No emergency rollback required.{Style.RESET_ALL}")
+
+def configure_settings():
+    """Interactive configuration menu to update tunable settings and persist them to disk."""
+    global CONFIG, RPC_URL, RPC_USER, RPC_PASS, MIN_PEERS_TO_SHOW, PEER_RECOVERY_DURATION, SEED_NODES, DEBUG_LOG_PATH, LOG_ARCHIVES_DIR, CACHE_FILE_PATH
+    
+    while True:
+        print("\n==================================================")
+        print(f"{Fore.CYAN}⚙️  SCRIPT CONFIGURATION & TUNABLE SETTINGS{Style.RESET_ALL}")
+        print("==================================================")
+        print(f"1. Min Peers Threshold to Show Fork:     {Fore.YELLOW}{MIN_PEERS_TO_SHOW}{Style.RESET_ALL}")
+        print(f"2. Peer Recovery Yellow Duration (sec):  {Fore.YELLOW}{PEER_RECOVERY_DURATION}{Style.RESET_ALL}")
+        print(f"3. RPC URL:                              {Fore.YELLOW}{RPC_URL}{Style.RESET_ALL}")
+        print(f"4. RPC Username:                         {Fore.YELLOW}{RPC_USER}{Style.RESET_ALL}")
+        print(f"5. RPC Password:                         {Fore.YELLOW}{'*****' if RPC_PASS else '(empty)'}{Style.RESET_ALL}")
+        print(f"6. Debug Log Path:                       {Fore.YELLOW}{DEBUG_LOG_PATH}{Style.RESET_ALL}")
+        print(f"7. Log Archives Directory:               {Fore.YELLOW}{LOG_ARCHIVES_DIR}{Style.RESET_ALL}")
+        print(f"8. Seed Nodes List:                      {Fore.YELLOW}{len(SEED_NODES)} configured{Style.RESET_ALL}")
+        print("[B] Back to Main Menu")
+        print("==================================================")
+        
+        choice = input("👉 Select setting to modify (1-8, or B): ").strip().lower()
+        
+        if choice == "1":
+            val = input(f"Enter new minimum peer threshold (current: {MIN_PEERS_TO_SHOW}): ").strip()
+            if val.isdigit():
+                MIN_PEERS_TO_SHOW = int(val)
+                CONFIG["MIN_PEERS_TO_SHOW"] = MIN_PEERS_TO_SHOW
+                save_config(CONFIG)
+            else:
+                print(f"{Fore.RED}{ICON_ERROR} Please enter a valid integer.{Style.RESET_ALL}")
+        elif choice == "2":
+            val = input(f"Enter peer recovery duration in seconds (current: {PEER_RECOVERY_DURATION}): ").strip()
+            if val.isdigit():
+                PEER_RECOVERY_DURATION = int(val)
+                CONFIG["PEER_RECOVERY_YELLOW_DURATION_SEC"] = PEER_RECOVERY_DURATION
+                save_config(CONFIG)
+            else:
+                print(f"{Fore.RED}{ICON_ERROR} Please enter a valid integer.{Style.RESET_ALL}")
+        elif choice == "3":
+            val = input(f"Enter new RPC URL (current: {RPC_URL}): ").strip()
+            if val:
+                RPC_URL = val
+                CONFIG["RPC_URL"] = RPC_URL
+                save_config(CONFIG)
+        elif choice == "4":
+            val = input(f"Enter new RPC Username (current: {RPC_USER}): ").strip()
+            if val:
+                RPC_USER = val
+                CONFIG["RPC_USER"] = RPC_USER
+                save_config(CONFIG)
+        elif choice == "5":
+            val = input("Enter new RPC Password: ").strip()
+            if val:
+                RPC_PASS = val
+                CONFIG["RPC_PASS"] = RPC_PASS
+                save_config(CONFIG)
+        elif choice == "6":
+            val = input(f"Enter new debug.log file path (current: {DEBUG_LOG_PATH}): ").strip()
+            if val:
+                DEBUG_LOG_PATH = val
+                CONFIG["DEBUG_LOG_PATH"] = DEBUG_LOG_PATH
+                save_config(CONFIG)
+        elif choice == "7":
+            val = input(f"Enter new log archives directory (current: {LOG_ARCHIVES_DIR}): ").strip()
+            if val:
+                LOG_ARCHIVES_DIR = val
+                CONFIG["LOG_ARCHIVES_DIR"] = LOG_ARCHIVES_DIR
+                save_config(CONFIG)
+        elif choice == "8":
+            print(f"Current Seed Nodes: {SEED_NODES}")
+            val = input("Enter comma-separated seed nodes (e.g. seed1.app,seed2.app): ").strip()
+            if val:
+                SEED_NODES = [s.strip() for s in val.split(",") if s.strip()]
+                CONFIG["SEED_NODES"] = SEED_NODES
+                save_config(CONFIG)
+        elif choice == "b":
+            break
+        else:
+            print(f"{Fore.RED}{ICON_ERROR} Invalid selection.{Style.RESET_ALL}")
+
+def menu():
+    while True:
+        print("\n==================================================")
+        print(f"{Fore.CYAN}🛡️  PKOIN NODE ON-CHAIN RECOVERY UTILITY{Style.RESET_ALL}")
+        print("==================================================")
+        print(f"{M_1}  Run Node Diagnostics & Check Sync Progress")
+        print(f"{M_2}  Live Node Health & Status 'Top' Monitor")
+        print(f"{M_3}  Kickstart Peers (Clear Bans & Force Seed Nodes)")
+        print(f"{M_4}  Fix Fork / Invalidate Stuck Block Height")
+        print(f"{M_5}  Generate Visual Fork Tree & Historical Peer Map")
+        print(f"{M_6}  Automated Fork Recovery (Rollback & Heal)")
+        print(f"{M_7}  Force Re-scan All Logs & Update Peer History Cache")
+        print(f"{M_8}  Configure Tunable Settings")
+        print("[Q]  Quit Utility")
+        print("==================================================")
+        
+        choice = input("👉 Enter Selection: ").strip().lower()
+        
+        if choice == "1":
+            check_status()
+        elif choice == "2":
+            node_top_dashboard()
+        elif choice == "3":
+            kickstart_peers()
+        elif choice == "4":
+            height = input("👉 Enter the block height where your node is stuck: ").strip()
+            if height.isdigit():
+                fix_fork_at_height(int(height))
+            else:
+                print(f"{Fore.RED}{ICON_ERROR} Invalid block height format.{Style.RESET_ALL}")
+        elif choice == "5":
+            generate_fork_tree()
+        elif choice == "6":
+            auto_recover_forks()
+        elif choice == "7":
+            scan_debug_log_for_bad_chains(force_rescan=True)
+        elif choice == "8":
+            configure_settings()
+        elif choice in ["q", "quit", "exit"]:
+            print("👋 Exiting recovery utility.")
+            break
+        else:
+            print(f"{Fore.RED}{ICON_ERROR} Invalid entry option.{Style.RESET_ALL}")
+
+if __name__ == "__main__":
+    menu()
